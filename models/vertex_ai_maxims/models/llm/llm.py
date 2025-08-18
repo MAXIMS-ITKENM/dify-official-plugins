@@ -43,19 +43,12 @@ from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
 from google.api_core import exceptions
 from google.oauth2 import service_account
 from google import genai
-from google.genai.types import Tool, GenerateContentConfig, GoogleSearch, ThinkingConfig, FunctionDeclaration, FunctionCall, Content, Part, CreateCachedContentConfig, UpdateCachedContentConfig
+from google.genai.types import Tool, GenerateContentConfig, GoogleSearch, FunctionDeclaration, FunctionCall, Content, Part
 from typing import Any
 from PIL import Image
 
 
 GLOBAL_ONLY_MODELS = ["gemini-2.5-pro-preview-06-05", "gemini-2.5-flash-lite-preview-06-17"]
-
-# Context caching minimum token requirements by model
-CACHE_MINIMUM_TOKENS = {
-    "gemini-2.5-pro": 2048,
-    "gemini-2.5-flash": 1024,
-    "gemini-2.5-flash-lite": 1024
-}
 
 # Set up logger for verbose messaging
 logger = logging.getLogger(__name__)
@@ -77,39 +70,6 @@ if not logger.handlers:
 
 
 class VertexAiLargeLanguageModel(LargeLanguageModel):
-    # Class-level cache for storing cache mappings
-    # Key: content hash, Value: {"cache_name": str, "timestamp": float, "user_id": str}
-    _cache_mapping = {}
-    _CACHE_CLEANUP_THRESHOLD = 100  # Clean up when we have more than 100 entries
-    _CACHE_MAX_AGE = 3200  # Remove entries older than 1 hour
-    
-    # Instance-level client caching
-    _CLIENT_CACHE_TTL = 3600  # Cache clients for 1 hour
-    
-    @property
-    def _client_cache(self):
-        """Lazy initialization of client cache to avoid __init__ issues."""
-        if not hasattr(self, '_client_cache_dict'):
-            self._client_cache_dict = {}
-        return self._client_cache_dict
-    
-    def _cleanup_cache_mapping(self):
-        """Clean up old cache mapping entries to prevent memory bloat."""
-        if len(self._cache_mapping) <= self._CACHE_CLEANUP_THRESHOLD:
-            return
-            
-        current_time = time.time()
-        keys_to_remove = []
-        
-        for key, entry in self._cache_mapping.items():
-            if current_time - entry["timestamp"] > self._CACHE_MAX_AGE:
-                keys_to_remove.append(key)
-        
-        for key in keys_to_remove:
-            del self._cache_mapping[key]
-            
-        if keys_to_remove:
-            logger.info(f"[CACHE] Cleaned up {len(keys_to_remove)} old cache entries, {len(self._cache_mapping)} remaining")
     
     def _get_credentials_hash(self, model: str, credentials: dict) -> str:
         """
@@ -135,21 +95,6 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         
         cache_key_str = json.dumps(cache_key_components, sort_keys=True)
         return hashlib.sha256(cache_key_str.encode('utf-8')).hexdigest()[:16]
-    
-    def _cleanup_client_cache(self):
-        """Clean up expired client cache entries."""
-        current_time = time.time()
-        keys_to_remove = []
-        
-        for key, entry in self._client_cache.items():
-            if current_time - entry["timestamp"] > self._CLIENT_CACHE_TTL:
-                keys_to_remove.append(key)
-        
-        for key in keys_to_remove:
-            del self._client_cache[key]
-            
-        if keys_to_remove:
-            logger.debug(f"[AUTH] Cleaned up {len(keys_to_remove)} expired client cache entries, {len(self._client_cache)} remaining")
     
     def _invoke(
         self,
@@ -561,120 +506,28 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             
         return has_files
 
-    def _get_cache_minimum_tokens(self, model: str) -> int:
-        """
-        Get minimum token count required for caching based on the model.
-        
-        :param model: model name
-        :return: minimum token count required for caching
-        """
-        # Check for exact model matches first
-        for model_prefix, min_tokens in CACHE_MINIMUM_TOKENS.items():
-            if model.startswith(model_prefix):
-                logger.debug(f"[CACHE] Model {model} matched prefix {model_prefix}, min tokens: {min_tokens}")
-                return min_tokens
-        
-        # Special case handling for preview models
-        if "preview" in model.lower():
-            if "pro" in model.lower():
-                logger.debug(f"[CACHE] Preview Pro model {model}, using 2048 tokens")
-                return 2048
-            else:
-                logger.debug(f"[CACHE] Preview Flash model {model}, using 1024 tokens")
-                return 1024
-        
-        # Default for unknown models (assuming most restrictive)
-        logger.warning(f"[CACHE] Unknown model {model}, using default 2048 tokens")
-        return 2048
-
-    def _check_cache_token_requirements(
+    def _generate(
         self,
-        client,
-        model: str,
-        system_instruction: str,
-        tools: list,
-        conversation_contents: Optional[list] = None,
-    ) -> tuple[bool, int]:
-        """
-        Check if content meets minimum token requirements for caching.
-        
-        :param client: authenticated genai client
-        :param model: model name
-        :param system_instruction: system instruction text
-        :param tools: list of tools
-        :param conversation_contents: optional conversation content list
-        :return: tuple of (meets_requirements, actual_token_count)
-        """
-        try:
-            # Prepare content for token counting
-            contents = []
-            
-            # Add conversation contents if provided
-            if conversation_contents:
-                contents.extend(conversation_contents)
-            
-            # For token counting, we need to simulate the cache content
-            # Create content that represents what would be cached
-            # if system_instruction or tools:
-            #     parts = []
-                
-            #     if system_instruction:
-            #         parts.append(Part(text=f"System: {system_instruction}"))
-                
-            #     if tools:
-            #         tools_text = f"Tools: {len(tools)} tools available"
-            #         parts.append(Part(text=tools_text))
-                
-            #     cache_simulation_content = Content(parts=parts)
-            #     contents.append(cache_simulation_content)
-            
-            # Count tokens using the official API
-            count_params = {
-                "model": model,
-                "contents": contents,
-            }
-            
-            # Add system instruction if present
-            if system_instruction:
-                count_params["system_instruction"] = system_instruction
-            
-            # Add tools if present
-            if tools:
-                count_params["tools"] = tools
-            
-            response = client.models.count_tokens(**count_params)
-            
-            actual_tokens = response.total_tokens or 0
-            min_required = self._get_cache_minimum_tokens(model)
-            
-            meets_requirements = actual_tokens >= min_required
-            
-            logger.info(f"[CACHE] Token validation: {actual_tokens} tokens (min required: {min_required}, meets requirement: {meets_requirements})")
-            
-            return meets_requirements, actual_tokens
-            
-        except Exception as e:
-            logger.warning(f"[CACHE] Failed to validate token requirements: {str(e)}")
-            # If we can't count tokens, be conservative and assume it doesn't meet requirements
-            return False, 0
-
-    def _create_or_get_cache(
-        self,
-        client,
         model: str,
         credentials: dict,
-        system_instruction: str,
-        tools: list,
-        conversation_id: Optional[str] = None,
-        conversation_contents: Optional[list] = None,
-    ) -> Optional[str]:
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        tools: Optional[list[PromptMessageTool]] = None,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        user_id: Optional[str] = None,
+    ) -> Union[LLMResult, Generator]:
         """
-        Create or retrieve a cached content for the given context using official genai client.
-        
-        For app-level caching: Uses system instruction + tools (no conversation_id or conversation_contents)
-        For conversation-level caching: Uses system instruction + tools + conversation_id + conversation_contents
-        
-        If cache exists, updates its TTL. Returns the cache name if successful, None otherwise.
+        Invoke large language model
+
+        :param model: model name
+        :param credentials: credentials kwargs
+        :param prompt_messages: prompt messages
+        :param model_parameters: model parameters
+        :param stop: stop words
+        :param stream: is stream response
+        :param user_id: unique user id
+        :return: full response or stream response chunk generator result
         """
         import time
         start_time = time.time()
