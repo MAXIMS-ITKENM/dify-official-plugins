@@ -1,0 +1,40 @@
+author: maxims-caterers-limited
+created_at: '2024-09-20T00:13:50.29298939-04:00'
+description:
+  en_US: Vertex AI in Google Cloud Platform for Maxims Caterers Limtied.
+icon: icon_s_en.svg
+label:
+  en_US: Vertex AI | Google Cloud Platform | Maxims Edition
+meta:
+  arch:
+  - amd64
+  - arm64
+  runner:
+    entrypoint: main
+    language: python
+    version: '3.12'
+  version: 0.0.1
+name: vertex_ai_maxims
+plugins:
+  models:
+  - provider/vertex_ai.yaml
+resource:
+  memory: 268435456
+  permission:
+    model:
+      enabled: true
+      llm: true
+      moderation: false
+      rerank: true
+      speech2text: false
+      text_embedding: true
+      tts: false
+    tool:
+      enabled: true
+    app:
+      enabled: true
+    storage:
+      enabled: true
+      size: 10485760
+type: plugin
+version: 0.0.1
