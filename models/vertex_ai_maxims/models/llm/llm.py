@@ -72,7 +72,6 @@ if not logger.handlers:
 class VertexAiLargeLanguageModel(LargeLanguageModel):
     
     def __init__(self):
-        super().__init__()
         # Client authentication cache - only for client credentials, not content caching
         self._client_cache = {}
         self._CLIENT_CACHE_TTL = 3600  # 1 hour TTL for client credentials cache
@@ -536,7 +535,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         user: Optional[str] = None,
     ) -> Union[LLMResult, Generator]:
         """
-        Invoke large language model
+        Invoke large language model using GenAI API
 
         :param model: model name
         :param credentials: credentials kwargs
@@ -560,100 +559,72 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             config_kwargs.pop("response_schema")
             
         dynamic_threshold = config_kwargs.pop("grounding", None)
-        if stop:
-            config_kwargs["stop_sequences"] = stop
-        service_account_info = (
-            json.loads(base64.b64decode(service_account_key))
-            if (
-                service_account_key := credentials.get("vertex_service_account_key", "")
-            )
-            else None
-        )
-        project_id = credentials["vertex_project_id"]
-        if model in GLOBAL_ONLY_MODELS:
-            location = "global"
-        elif "preview" in model:
-            location = "us-central1"
-        else:
-            location = credentials["vertex_location"]
-        if service_account_info:
-            service_accountSA = service_account.Credentials.from_service_account_info(service_account_info)
-            aiplatform.init(credentials=service_accountSA, project=project_id, location=location, api_transport="rest")
-        else:
-            aiplatform.init(project=project_id, location=location, api_transport="rest")
-            
+        
+        # Create authenticated client
+        client = self._create_authenticated_client(model, credentials)
+        
+        # Convert messages to genai format
         history = []
         system_instruction = ""
         
         for msg in prompt_messages:
-
             if isinstance(msg, SystemPromptMessage):
-                system_instruction = msg.content
+                system_instruction = msg.content if isinstance(msg.content, str) else str(msg.content)
             else:
-                content = self._format_message_to_glm_content(msg)
+                content = self._format_message_to_genai_content(msg)
+                history.append(content)
 
-                if history and history[-1].role == content.role:
+        # Prepare tools
+        function_tools = None
+        if tools:
+            function_tools = self._convert_tools_to_genai_tool(tools)
+            if dynamic_threshold:
+                # Function tools take precedence over Google Search
+                dynamic_threshold = None
+        elif dynamic_threshold:
+            # Use Google Search only if no function tools
+            function_tools = [Tool(google_search=GoogleSearch())]
+            dynamic_threshold = None
 
-                    all_parts = list(history[-1].parts)
-                    all_parts.extend(content.parts)
+        # Prepare generation config
+        config_dict = {}
+        if response_schema:
+            config_dict["response_schema"] = response_schema
+            config_dict["response_mime_type"] = "application/json"
+        elif "response_mime_type" in config_kwargs:
+            config_dict["response_mime_type"] = config_kwargs.pop("response_mime_type")
+            
+        if stop and isinstance(stop, list):
+            config_dict["stop_sequences"] = stop
+        elif stop:
+            config_dict["stop_sequences"] = [stop] if isinstance(stop, str) else []
+            
+        # Copy other model parameters
+        for key, value in config_kwargs.items():
+            if key not in ["stop_sequences"]:
+                config_dict[key] = value
 
-                    history[-1] = glm.Content(
-                        role=history[-1].role,
-                        parts=all_parts
-                    )
-
-                else:
-                    history.append(content)
-
-        if dynamic_threshold is not None and model.startswith("gemini-2."):
-            SCOPES = [
-                "https://www.googleapis.com/auth/cloud-platform",
-                "https://www.googleapis.com/auth/generative-language"
-            ]
-            credential = service_account.Credentials.from_service_account_info(
-                service_account_info,
-                scopes=SCOPES
+        generation_config = GenerateContentConfig(
+            tools=function_tools,
+            response_modalities=["TEXT"],
+            system_instruction=system_instruction,
+            **config_dict
+        )
+        
+        if stream:
+            response = client.models.generate_content_stream(
+                model=model,
+                contents=history,
+                config=generation_config
             )
-            client = genai.Client(credentials=credential, project=project_id, location=location, vertexai=True)
-
-            google_search_tool = Tool(google_search=GoogleSearch())
+            return self._handle_generate_stream_response(model, credentials, response, prompt_messages, system_instruction)
+        else:
             response = client.models.generate_content(
                 model=model,
-                contents=[item.to_dict() for item in history],
-                config=GenerateContentConfig(
-                    tools=[google_search_tool],
-                    response_modalities=["TEXT"],
-                    system_instruction=system_instruction
-                )
-            )
-        else:
-            google_model = glm.GenerativeModel(model_name=model, system_instruction=system_instruction)
-
-            if dynamic_threshold is not None:
-                tools = self._convert_grounding_to_glm_tool(dynamic_threshold=dynamic_threshold)
-            else:
-                tools = self._convert_tools_to_glm_tool(tools) if tools else None
-            mime_type = config_kwargs.pop("response_mime_type", None)
-
-            generation_config_params = config_kwargs.copy()
-
-            if response_schema:
-                generation_config_params["response_schema"] = response_schema
-                generation_config_params["response_mime_type"] = "application/json"
-            elif mime_type:
-                generation_config_params["response_mime_type"] = mime_type
-
-            generation_config = glm.GenerationConfig(**generation_config_params)
-
-            response = google_model.generate_content(
                 contents=history,
-                generation_config=generation_config,
-                stream=stream,
-                tools=tools,
+                config=generation_config
             )
-        if stream:
-            return self._handle_generate_stream_response(model, credentials, response, prompt_messages, system_instruction)
-        return self._handle_generate_response(model, credentials, response, prompt_messages)
+            return self._handle_generate_response(model, credentials, response, prompt_messages)
 
     def _handle_generate_response(
         self, model: str, credentials: dict, response, prompt_messages: list[PromptMessage]
