@@ -71,6 +71,24 @@ if not logger.handlers:
 
 class VertexAiLargeLanguageModel(LargeLanguageModel):
     
+    def __init__(self):
+        super().__init__()
+        # Client authentication cache - only for client credentials, not content caching
+        self._client_cache = {}
+        self._CLIENT_CACHE_TTL = 3600  # 1 hour TTL for client credentials cache
+        
+    def _cleanup_client_cache(self):
+        """Clean up expired client cache entries"""
+        current_time = time.time()
+        expired_keys = []
+        for key, entry in self._client_cache.items():
+            if current_time - entry["timestamp"] >= self._CLIENT_CACHE_TTL:
+                expired_keys.append(key)
+        
+        for key in expired_keys:
+            del self._client_cache[key]
+            logger.debug(f"[AUTH] Removed expired client cache entry: {key}")
+    
     def _get_credentials_hash(self, model: str, credentials: dict) -> str:
         """
         Generate a hash for the credentials to use as cache key.
@@ -515,7 +533,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         tools: Optional[list[PromptMessageTool]] = None,
         stop: Optional[list[str]] = None,
         stream: bool = True,
-        user_id: Optional[str] = None,
+        user: Optional[str] = None,
     ) -> Union[LLMResult, Generator]:
         """
         Invoke large language model
@@ -526,426 +544,116 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         :param model_parameters: model parameters
         :param stop: stop words
         :param stream: is stream response
-        :param user_id: unique user id
+        :param user: unique user id
         :return: full response or stream response chunk generator result
         """
-        import time
-        start_time = time.time()
-        
-        # Cleanup old cache entries periodically
-        self._cleanup_cache_mapping()
-        
-        try:
-            # Determine cache type and log operation start
-            is_conversation_cache = conversation_id and conversation_contents
-            cache_type = "conversation-level" if is_conversation_cache else "app-level"
-            logger.info(f"[CACHE] Starting {cache_type} cache operation for model {model}")
-            
-            # Create cache ID based on context type
-            if is_conversation_cache:
-                # Conversation-level cache with full conversation history
-                conversation_hash = hashlib.sha256(json.dumps([c.to_dict() for c in conversation_contents or []], sort_keys=True).encode('utf-8')).hexdigest()[:12]
-                cache_content = f"conv-{conversation_id}-{model}-{system_instruction}-{json.dumps([self._tool_to_dict(t) for t in tools], sort_keys=True)}-history-{conversation_hash}"
-                cache_id_prefix = "dify-conv-cache"
-                cache_display_name = f"dify-conversation-cache-{int(time.time())}"
-                ttl = "1800s"  # 30 minutes for conversation-level cache
-                logger.info(f"[CACHE] Conversation cache: conversation_id={conversation_id}, history_items={len(conversation_contents or [])}")
-                logger.debug(f"[CACHE] Conversation hash: {conversation_hash}")
-            else:
-                # App-level cache (no conversation history)
-                cache_content = f"app-{model}-{system_instruction}-{json.dumps([self._tool_to_dict(t) for t in tools], sort_keys=True)}"
-                cache_id_prefix = "dify-app-cache"
-                cache_display_name = f"dify-app-cache-{int(time.time())}"
-                ttl = "3600s"  # 1 hour for app-level cache
-                logger.info(f"[CACHE] App-level cache: tools_count={len(tools) if tools else 0}")
-            
-            # Create content hash for cache lookup - include user_id for better cache isolation
-            if is_conversation_cache:
-                # Conversation-level cache with full conversation history
-                conversation_hash = hashlib.sha256(json.dumps([c.to_dict() for c in conversation_contents or []], sort_keys=True).encode('utf-8')).hexdigest()[:12]
-                cache_content = f"conv-{conversation_id}-{model}-{system_instruction}-{json.dumps([self._tool_to_dict(t) for t in tools], sort_keys=True)}-history-{conversation_hash}"
-                cache_display_name = f"dify-conversation-cache-{int(time.time())}"
-                ttl = "1800s"  # 30 minutes for conversation-level cache
-                logger.info(f"[CACHE] Conversation cache: conversation_id={conversation_id}, history_items={len(conversation_contents or [])}")
-                logger.debug(f"[CACHE] Conversation hash: {conversation_hash}")
-            else:
-                # App-level cache (no conversation history) - include basic context to isolate per application
-                # Use a combination of system instruction, tools, and model to create app-level context
-                app_context = f"sys:{len(system_instruction) if system_instruction else 0}"
-                tools_context = f"tools:{len(tools) if tools else 0}"
-                cache_content = f"app-{model}-{app_context}-{tools_context}-{hashlib.sha256(system_instruction.encode('utf-8') if system_instruction else b'').hexdigest()[:8]}"
-                if tools:
-                    tools_hash = hashlib.sha256(json.dumps([self._tool_to_dict(t) for t in tools], sort_keys=True).encode('utf-8')).hexdigest()[:8]
-                    cache_content += f"-{tools_hash}"
-                cache_display_name = f"dify-app-cache-{int(time.time())}"
-                ttl = "3600s"  # 1 hour for app-level cache
-                logger.info(f"[CACHE] App-level cache: tools_count={len(tools) if tools else 0}")
-            
-            # Create content hash as our local cache key
-            content_hash = hashlib.sha256(cache_content.encode('utf-8')).hexdigest()[:16]
-            logger.info(f"[CACHE] Generated content hash: {content_hash}")
-            logger.debug(f"[CACHE] Cache config: display_name={cache_display_name}, ttl={ttl}")
-            
-            # Check if we have this cache in our local mapping
-            cache_lookup_start = time.time()
-            cached_entry = self._cache_mapping.get(content_hash)
-            cached_google_name = cached_entry.get("cache_name") if cached_entry else None
-            
-            if cached_google_name:
-                # We have a cached name, try to verify it still exists
-                try:
-                    content_cache = client.caches.get(name=cached_google_name)
-                    cache_lookup_time = time.time() - cache_lookup_start
-                    
-                    logger.info(f"[CACHE] Cache HIT: Found existing cache via mapping (lookup took {cache_lookup_time:.3f}s)")
-                    logger.debug(f"[CACHE] Current expire time: {content_cache.expire_time}")
-                    logger.debug(f"[CACHE] Using cached Google name: {cached_google_name}")
-                    
-                    # Update the cache entry timestamp and TTL
-                    self._cache_mapping[content_hash]["timestamp"] = time.time()
-                    
-                    # Update the cache TTL to extend its life
-                    ttl_update_start = time.time()
-                    try:
-                        updated_cache = client.caches.update(
-                            name=cached_google_name, 
-                            config=UpdateCachedContentConfig(ttl=ttl)
-                        )
-                        ttl_update_time = time.time() - ttl_update_start
-                        total_time = time.time() - start_time
-                        
-                        logger.info(f"[CACHE] Cache TTL updated in {ttl_update_time:.3f}s, new expire time: {updated_cache.expire_time}")
-                        logger.info(f"[CACHE] Cache retrieval and update completed in {total_time:.3f}s")
-                        
-                        return cached_google_name
-                    except Exception as update_error:
-                        logger.warning(f"[CACHE] Failed to update cache TTL: {str(update_error)}")
-                        # Return the cache name anyway, it's still valid
-                        total_time = time.time() - start_time
-                        logger.info(f"[CACHE] Cache retrieval completed in {total_time:.3f}s (TTL update failed)")
-                        return cached_google_name
-                        
-                except Exception as verify_error:
-                    # Cache no longer exists, remove from mapping
-                    logger.info(f"[CACHE] Cached name no longer valid, removing from mapping: {str(verify_error)}")
-                    del self._cache_mapping[content_hash]
-                    cached_google_name = None
-            
-            if not cached_google_name:
-                cache_lookup_time = time.time() - cache_lookup_start
-                logger.info(f"[CACHE] Cache MISS: No valid cache found (lookup took {cache_lookup_time:.3f}s)")
-                logger.info(f"[CACHE] Creating new {cache_type} cache")
-                
-                # Check token requirements before attempting cache creation
-                token_check_start = time.time()
-                meets_requirements, actual_tokens = self._check_cache_token_requirements(
-                    client, model, system_instruction, tools, 
-                    conversation_contents if is_conversation_cache else None
-                )
-                token_check_time = time.time() - token_check_start
-                
-                if not meets_requirements:
-                    min_required = self._get_cache_minimum_tokens(model)
-                    total_time = time.time() - start_time
-                    logger.warning(f"[CACHE] Token validation FAILED: {actual_tokens} tokens < {min_required} required (check took {token_check_time:.3f}s)")
-                    logger.warning(f"[CACHE] Skipping cache creation due to insufficient tokens (total time: {total_time:.3f}s)")
-                    return None
-                
-                logger.info(f"[CACHE] Token validation PASSED: {actual_tokens} tokens meet requirements (check took {token_check_time:.3f}s)")
-                
-                cache_creation_start = time.time()
-                try:
-                    # Prepare cache configuration
-                    if is_conversation_cache:
-                        # For conversation-level cache with full conversation history
-                        cache_config = CreateCachedContentConfig(
-                            contents=conversation_contents or [],
-                            system_instruction=system_instruction,
-                            tools=tools if tools else None,
-                            display_name=cache_display_name,
-                            ttl=ttl,
-                        )
-                        logger.debug(f"[CACHE] Conversation cache config: contents={len(conversation_contents or [])} items, tools={len(tools) if tools else 0}")
-                    else:
-                        # For app-level cache without conversation history
-                        cache_config = CreateCachedContentConfig(
-                            system_instruction=system_instruction,
-                            tools=tools if tools else None,
-                            display_name=cache_display_name,
-                            ttl=ttl,
-                        )
-                        logger.debug(f"[CACHE] App-level cache config: tools={len(tools) if tools else 0}")
-                    
-                    # Create the cache using official client
-                    content_cache = client.caches.create(
-                        model=model,
-                        config=cache_config
-                    )
-                    
-                    cache_creation_time = time.time() - cache_creation_start
-                    total_time = time.time() - start_time
-                    
-                    # Store the mapping between our hash and Google's cache name with metadata
-                    google_cache_name = content_cache.name
-                    self._cache_mapping[content_hash] = {
-                        "cache_name": google_cache_name,
-                        "timestamp": time.time(),
-                        "cache_type": cache_type,
-                        "model": model
-                    }
-                    
-                    logger.info(f"[CACHE] Cache CREATE SUCCESS: {google_cache_name} created in {cache_creation_time:.3f}s")
-                    logger.debug(f"[CACHE] Stored mapping: {content_hash} -> {google_cache_name}")
-                    logger.info(f"[CACHE] Cache mapping size: {len(self._cache_mapping)} entries")
-                    if hasattr(content_cache, 'usage_metadata'):
-                        logger.debug(f"[CACHE] Cache usage metadata: {content_cache.usage_metadata}")
-                    logger.info(f"[CACHE] Total cache creation completed in {total_time:.3f}s")
-                    
-                    return google_cache_name
-                    
-                except Exception as create_error:
-                    cache_creation_time = time.time() - cache_creation_start
-                    total_time = time.time() - start_time
-                    logger.error(f"[CACHE] Cache CREATE FAILED after {cache_creation_time:.3f}s: {str(create_error)}")
-                    logger.debug(f"[CACHE] Cache creation error details: {type(create_error).__name__}: {str(create_error)}")
-                    logger.error(f"[CACHE] Total failed cache operation took {total_time:.3f}s")
-                    return None
-                
-        except Exception as e:
-            # Log the error but don't fail the request
-            operation_time = time.time() - start_time
-            logger.error(f"[CACHE] Cache operation FAILED after {operation_time:.3f}s: {str(e)}")
-            logger.debug(f"[CACHE] Cache operation error details: {type(e).__name__}: {str(e)}")
-            return None
-
-    def _generate(
-        self,
-        model: str,
-        credentials: dict,
-        prompt_messages: list[PromptMessage],
-        model_parameters: dict,
-        tools: Optional[list[PromptMessageTool]] = None,
-        stop: Optional[list[str]] = None,
-        stream: bool = True,
-        user_id: Optional[str] = None,
-    ) -> Union[LLMResult, Generator]:
-        """
-        Invoke large language model
-
-        :param model: model name
-        :param credentials: credentials kwargs
-        :param prompt_messages: prompt messages
-        :param model_parameters: model parameters
-        :param stop: stop words
-        :param stream: is stream response
-        :param user_id: unique user id
-        :return: full response or stream response chunk generator result
-        """
-        import time
-        generation_start = time.time()
-        
-        logger.info(f"[GENERATION] Starting generation for model {model}")
-        logger.info(f"[GENERATION] Parameters: messages={len(prompt_messages)}, tools={len(tools) if tools else 0}, stream={stream}, user_id={user_id}")
-        logger.debug(f"[GENERATION] Model parameters: {model_parameters}")
-        
         config_kwargs = model_parameters.copy()
         config_kwargs["max_output_tokens"] = config_kwargs.pop("max_tokens_to_sample", None)
         
         response_schema = None
         if "json_schema" in config_kwargs:
             response_schema = self._convert_schema_for_vertex(config_kwargs.pop("json_schema"))
-            logger.debug(f"[GENERATION] Using JSON schema from json_schema parameter")
         elif "response_schema" in config_kwargs:
             response_schema = self._convert_schema_for_vertex(config_kwargs.pop("response_schema"))
-            logger.debug(f"[GENERATION] Using JSON schema from response_schema parameter")
             
         if "response_schema" in config_kwargs:
             config_kwargs.pop("response_schema")
             
-        enable_context_caching = config_kwargs.pop("context_caching", False)
-        dynamic_threshold = config_kwargs.pop("grounding", False)
-        no_thinking = config_kwargs.pop("no_thinking", False)
-        thinking_budget = config_kwargs.pop("thinking_budget", None)
-        
-        logger.info(f"[GENERATION] Special features: context_caching={enable_context_caching}, grounding={dynamic_threshold}, no_thinking={no_thinking}, thinking_budget={thinking_budget}")
-        
-        # Handle thinking configuration logic
-        if no_thinking:
-            thinking_budget = 0  # Disable thinking
-            logger.debug(f"[GENERATION] Thinking disabled via no_thinking parameter")
-        elif thinking_budget is None:
-            thinking_budget = -1  # Let model control budget
-            logger.debug(f"[GENERATION] Thinking budget set to model control (-1)")
+        dynamic_threshold = config_kwargs.pop("grounding", None)
+        if stop:
+            config_kwargs["stop_sequences"] = stop
+        service_account_info = (
+            json.loads(base64.b64decode(service_account_key))
+            if (
+                service_account_key := credentials.get("vertex_service_account_key", "")
+            )
+            else None
+        )
+        project_id = credentials["vertex_project_id"]
+        if model in GLOBAL_ONLY_MODELS:
+            location = "global"
+        elif "preview" in model:
+            location = "us-central1"
         else:
-            logger.debug(f"[GENERATION] Thinking budget set to {thinking_budget}")
-        
-        custom_labels_str = credentials.get("vertex_custom_labels")
-        labels = None
-        if custom_labels_str:
-            try:
-                labels = json.loads(custom_labels_str)
-                logger.debug(f"[GENERATION] Custom labels parsed: {len(labels) if labels else 0} labels")
-            except (json.JSONDecodeError, TypeError):
-                labels = None
-                logger.warning(f"[GENERATION] Failed to parse custom labels: {custom_labels_str}")
-
-        # Convert messages to genai format
-        message_conversion_start = time.time()
+            location = credentials["vertex_location"]
+        if service_account_info:
+            service_accountSA = service_account.Credentials.from_service_account_info(service_account_info)
+            aiplatform.init(credentials=service_accountSA, project=project_id, location=location, api_transport="rest")
+        else:
+            aiplatform.init(project=project_id, location=location, api_transport="rest")
+            
         history = []
         system_instruction = ""
         
-        for i, msg in enumerate(prompt_messages):
+        for msg in prompt_messages:
+
             if isinstance(msg, SystemPromptMessage):
-                system_instruction = msg.content if isinstance(msg.content, str) else str(msg.content)
-                logger.debug(f"[GENERATION] System instruction found at message {i}: {len(system_instruction)} chars")
+                system_instruction = msg.content
             else:
-                content = self._format_message_to_genai_content(msg)
-                history.append(content)
-                logger.debug(f"[GENERATION] Converted message {i} ({type(msg).__name__}) to genai format")
-        
-        message_conversion_time = time.time() - message_conversion_start
-        logger.debug(f"[GENERATION] Message conversion completed in {message_conversion_time:.3f}s: {len(history)} history items")
+                content = self._format_message_to_glm_content(msg)
 
-        # Set up authentication and client
-        auth_start = time.time()
-        client = self._create_authenticated_client(model, credentials)
-        auth_time = time.time() - auth_start
-        logger.debug(f"[GENERATION] Client authentication completed in {auth_time:.3f}s")
+                if history and history[-1].role == content.role:
 
-        # Prepare tools
-        tools_start = time.time()
-        
-        # Note: Google AI/Vertex AI API doesn't support mixing Google Search tools with function tools
-        # We prioritize function tools over Google Search when both are requested
-        if tools:
-            function_tools = self._convert_tools_to_genai_tool(tools)
-            logger.debug(f"[GENERATION] Converted {len(function_tools)} function tools to genai format")
-            if dynamic_threshold:
-                logger.debug(f"[GENERATION] Google Search grounding disabled due to function tools being present (API limitation)")
-        elif dynamic_threshold:
-            google_search_tool = Tool(google_search=GoogleSearch())
-            logger.debug(f"[GENERATION] Added Google Search tool for grounding")
-        
-        tools_time = time.time() - tools_start
-        logger.info(f"[GENERATION] Tools preparation completed in {tools_time:.3f}s: {len(function_tools)} total tools")
+                    all_parts = list(history[-1].parts)
+                    all_parts.extend(content.parts)
 
-        # Handle context caching
-        caching_start = time.time()
-        cached_content_name = None
-        if enable_context_caching and (system_instruction or function_tools):
-            logger.info(f"[GENERATION] Context caching enabled - checking conversation for files")
-            
-            # Check if conversation contains files
-            has_files = self._has_files_in_conversation(prompt_messages)
-            
-            if has_files:
-                # Conversation-level caching: include entire conversation history
-                conversation_id = user_id or f"conv-{int(time.time())}"  # Use user_id as conversation ID or generate one
-                
-                # Include all conversation content for caching (users, assistant, and files)
-                conversation_contents = []
-                for msg in prompt_messages:
-                    if not isinstance(msg, SystemPromptMessage):  # Exclude system message as it's handled separately
-                        content = self._format_message_to_genai_content(msg)
-                        conversation_contents.append(content)
-                
-                logger.info(f"[GENERATION] Files detected - using conversation-level caching with {len(conversation_contents)} content items, conversation_id={conversation_id}")
-                cached_content_name = self._create_or_get_cache(
-                    client, model, credentials, system_instruction, function_tools, 
-                    conversation_id=conversation_id, conversation_contents=conversation_contents
-                )
-            else:
-                # App-level caching: only system instruction and tools
-                logger.info(f"[GENERATION] No files detected - using app-level caching")
-                cached_content_name = self._create_or_get_cache(
-                    client, model, credentials, system_instruction, function_tools
-                )
-        elif enable_context_caching:
-            logger.warning(f"[GENERATION] Context caching enabled but no system instruction or tools available")
-        else:
-            logger.info(f"[GENERATION] Context caching disabled")
-            
-        caching_time = time.time() - caching_start
-        cache_status = "SUCCESS" if cached_content_name else "NONE"
-        logger.info(f"[GENERATION] Caching operation completed in {caching_time:.3f}s: {cache_status}")
-        if cached_content_name:
-            logger.debug(f"[GENERATION] Using cached content: {cached_content_name}")
+                    history[-1] = glm.Content(
+                        role=history[-1].role,
+                        parts=all_parts
+                    )
 
-        # Prepare generation config
-        config_prep_start = time.time()
-        config_dict = {}
-        if thinking_budget == 0:
-            # Thinking is disabled via no_thinking parameter
-            thinking_config = None
-            logger.debug(f"[GENERATION] Thinking disabled")
-        elif thinking_budget != -1:
-            thinking_config = ThinkingConfig(thinking_budget=thinking_budget)
-            logger.debug(f"[GENERATION] Thinking enabled with budget {thinking_budget}")
-        else:
-            thinking_config = None
-            logger.debug(f"[GENERATION] Thinking enabled with model-controlled budget")
-            
-        if response_schema:
-            config_dict["response_schema"] = response_schema
-            config_dict["response_mime_type"] = "application/json"
-            logger.debug(f"[GENERATION] JSON response schema configured")
-        elif "response_mime_type" in config_kwargs:
-            config_dict["response_mime_type"] = config_kwargs.pop("response_mime_type")
-            logger.debug(f"[GENERATION] Response MIME type: {config_dict['response_mime_type']}")
-            
-        if stop and isinstance(stop, list):
-            config_dict["stop_sequences"] = stop
-            logger.debug(f"[GENERATION] Stop sequences: {stop}")
-        elif stop:
-            # Handle case where stop might not be a list
-            config_dict["stop_sequences"] = [stop] if isinstance(stop, str) else []
-            logger.debug(f"[GENERATION] Stop sequences (converted): {config_dict['stop_sequences']}")
-            
-        # Copy other model parameters
-        for key, value in config_kwargs.items():
-            if key not in ["stop_sequences"]:  # Already handled
-                config_dict[key] = value
+                else:
+                    history.append(content)
 
-        config_prep_time = time.time() - config_prep_start
-        logger.debug(f"[GENERATION] Generation config prepared in {config_prep_time:.3f}s")
-
-        # Generate content
-        content_generation_start = time.time()
-        generation_config = GenerateContentConfig(
-            tools=function_tools if function_tools and not cached_content_name else None,
-            response_modalities=["TEXT"],
-            system_instruction=system_instruction if not cached_content_name else None,
-            thinking_config=thinking_config,
-            cached_content=cached_content_name,
-            **config_dict
-        )
-        
-        logger.info(f"[GENERATION] Starting content generation: stream={stream}")
-        logger.debug(f"[GENERATION] Final config: tools={len(function_tools) if function_tools and not cached_content_name else 0}, cached_content={bool(cached_content_name)}")
-        
-        setup_time = time.time() - generation_start
-        logger.info(f"[GENERATION] Setup completed in {setup_time:.3f}s - starting model call")
-        
-        if stream:
-            response = client.models.generate_content_stream(
-                model=model,
-                contents=history,
-                config=generation_config
+        if dynamic_threshold is not None and model.startswith("gemini-2."):
+            SCOPES = [
+                "https://www.googleapis.com/auth/cloud-platform",
+                "https://www.googleapis.com/auth/generative-language"
+            ]
+            credential = service_account.Credentials.from_service_account_info(
+                service_account_info,
+                scopes=SCOPES
             )
-            content_generation_time = time.time() - content_generation_start
-            total_time = time.time() - generation_start
-            logger.info(f"[GENERATION] Stream response initiated in {content_generation_time:.3f}s (total: {total_time:.3f}s)")
-            return self._handle_generate_stream_response(model, credentials, response, prompt_messages, system_instruction)
-        else:
+            client = genai.Client(credentials=credential, project=project_id, location=location, vertexai=True)
+
+            google_search_tool = Tool(google_search=GoogleSearch())
             response = client.models.generate_content(
                 model=model,
-                contents=history,
-                config=generation_config
+                contents=[item.to_dict() for item in history],
+                config=GenerateContentConfig(
+                    tools=[google_search_tool],
+                    response_modalities=["TEXT"],
+                    system_instruction=system_instruction
+                )
             )
-            content_generation_time = time.time() - content_generation_start
-            total_time = time.time() - generation_start
-            logger.info(f"[GENERATION] Non-stream response completed in {content_generation_time:.3f}s (total: {total_time:.3f}s)")
-            return self._handle_generate_response(model, credentials, response, prompt_messages)
+        else:
+            google_model = glm.GenerativeModel(model_name=model, system_instruction=system_instruction)
+
+            if dynamic_threshold is not None:
+                tools = self._convert_grounding_to_glm_tool(dynamic_threshold=dynamic_threshold)
+            else:
+                tools = self._convert_tools_to_glm_tool(tools) if tools else None
+            mime_type = config_kwargs.pop("response_mime_type", None)
+
+            generation_config_params = config_kwargs.copy()
+
+            if response_schema:
+                generation_config_params["response_schema"] = response_schema
+                generation_config_params["response_mime_type"] = "application/json"
+            elif mime_type:
+                generation_config_params["response_mime_type"] = mime_type
+
+            generation_config = glm.GenerationConfig(**generation_config_params)
+
+            response = google_model.generate_content(
+                contents=history,
+                generation_config=generation_config,
+                stream=stream,
+                tools=tools,
+            )
+        if stream:
+            return self._handle_generate_stream_response(model, credentials, response, prompt_messages, system_instruction)
+        return self._handle_generate_response(model, credentials, response, prompt_messages)
 
     def _handle_generate_response(
         self, model: str, credentials: dict, response, prompt_messages: list[PromptMessage]
