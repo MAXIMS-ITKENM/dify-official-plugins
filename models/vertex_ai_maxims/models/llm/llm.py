@@ -43,7 +43,7 @@ from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
 from google.api_core import exceptions
 from google.oauth2 import service_account
 from google import genai
-from google.genai.types import Tool, GenerateContentConfig, GoogleSearch, FunctionDeclaration, FunctionCall, Content, Part
+from google.genai.types import Tool, GenerateContentConfig, GoogleSearch, FunctionDeclaration, FunctionCall, Content, Part, ThinkingConfig
 from typing import Any
 from PIL import Image
 
@@ -559,6 +559,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             config_kwargs.pop("response_schema")
             
         dynamic_threshold = config_kwargs.pop("grounding", None)
+        thinking_budget = config_kwargs.pop("thinking_budget", None)
         
         # Create authenticated client
         client = self._create_authenticated_client(model, credentials)
@@ -588,6 +589,12 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
 
         # Prepare generation config
         config_dict = {}
+        
+        # Handle thinking configuration
+        thinking_config = None
+        if thinking_budget is not None:
+            thinking_config = ThinkingConfig(thinking_budget=thinking_budget)
+        
         if response_schema:
             config_dict["response_schema"] = response_schema
             config_dict["response_mime_type"] = "application/json"
@@ -608,6 +615,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             tools=function_tools,
             response_modalities=["TEXT"],
             system_instruction=system_instruction,
+            thinking_config=thinking_config,
             **config_dict
         )
         
