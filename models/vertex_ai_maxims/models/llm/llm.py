@@ -495,6 +495,71 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             # Fallback to string representation
             return str(obj)
 
+    def _sanitize_labels(self, labels: dict) -> dict:
+        """
+        Sanitize labels to meet Google Cloud label requirements:
+        - Keys and values can only contain lowercase letters, numeric characters, underscores, and dashes
+        - International characters are allowed (UTF-8)
+        - All characters must use UTF-8 encoding
+        
+        :param labels: Raw labels dictionary
+        :return: Sanitized labels dictionary that meets Google Cloud requirements
+        """
+        import re
+        
+        sanitized_labels = {}
+        
+        # Pattern for valid label characters: lowercase letters, numbers, underscores, dashes, and international UTF-8 chars
+        # This allows all UTF-8 characters but converts uppercase to lowercase
+        valid_pattern = re.compile(r'^[a-z0-9_\-\u0080-\uFFFF]+$')
+        
+        for key, value in labels.items():
+            try:
+                # Convert to string and ensure UTF-8 encoding
+                str_key = str(key).encode('utf-8').decode('utf-8')
+                str_value = str(value).encode('utf-8').decode('utf-8')
+                
+                # Convert to lowercase and replace invalid characters
+                clean_key = self._clean_label_string(str_key)
+                clean_value = self._clean_label_string(str_value)
+                
+                # Validate after cleaning
+                if clean_key and clean_value and valid_pattern.match(clean_key) and valid_pattern.match(clean_value):
+                    sanitized_labels[clean_key] = clean_value
+                    if clean_key != str_key or clean_value != str_value:
+                        logger.debug(f"[LABELS] Sanitized label: '{str_key}': '{str_value}' -> '{clean_key}': '{clean_value}'")
+                else:
+                    logger.warning(f"[LABELS] Skipping invalid label after sanitization: '{str_key}': '{str_value}'")
+                    
+            except (UnicodeError, UnicodeDecodeError, UnicodeEncodeError) as e:
+                logger.warning(f"[LABELS] Skipping label with encoding issues: '{key}': '{value}' - {e}")
+            except Exception as e:
+                logger.warning(f"[LABELS] Skipping label due to error: '{key}': '{value}' - {e}")
+        
+        return sanitized_labels
+    
+    def _clean_label_string(self, text: str) -> str:
+        """
+        Clean a label string to meet Google Cloud requirements
+        
+        :param text: Input text to clean
+        :return: Cleaned text with only valid characters, or empty string if no valid characters
+        """
+        import re
+        
+        # Convert to lowercase
+        text = text.lower()
+        
+        # Replace spaces and other common invalid characters with underscores
+        text = re.sub(r'[^a-z0-9_\-\u0080-\uFFFF]', '_', text)
+        
+        # Remove leading/trailing underscores and dashes, and collapse multiple consecutive ones
+        text = re.sub(r'^[_\-]+|[_\-]+$', '', text)
+        text = re.sub(r'[_\-]{2,}', '_', text)
+        
+        # Return empty string if no valid characters remain
+        return text if text else ""
+
     def validate_credentials(self, model: str, credentials: dict) -> None:
         """
         Validate model credentials
@@ -585,11 +650,19 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         labels = None
         if custom_labels_str:
             try:
-                labels = json.loads(custom_labels_str)
-                logger.debug(f"[GENERATION] Custom labels parsed: {len(labels) if labels else 0} labels")
-            except (json.JSONDecodeError, TypeError):
+                raw_labels = json.loads(custom_labels_str)
+                if isinstance(raw_labels, dict):
+                    # Sanitize labels to meet Google Cloud requirements
+                    labels = self._sanitize_labels(raw_labels)
+                    if labels:
+                        logger.debug(f"[GENERATION] Custom labels sanitized and parsed: {len(labels)} labels")
+                    else:
+                        logger.warning(f"[GENERATION] All labels were invalid and filtered out")
+                else:
+                    logger.warning(f"[GENERATION] Custom labels must be a dictionary, got {type(raw_labels)}")
+            except (json.JSONDecodeError, TypeError) as e:
                 labels = None
-                logger.warning(f"[GENERATION] Failed to parse custom labels: {custom_labels_str}")
+                logger.warning(f"[GENERATION] Failed to parse custom labels: {e}")
         
         # Create authenticated client
         client = self._create_authenticated_client(model, credentials)
