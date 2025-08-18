@@ -74,19 +74,18 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
     def __init__(self):
         # Client authentication cache - only for client credentials, not content caching
         self._client_cache = {}
-        self._CLIENT_CACHE_TTL = 3600  # 1 hour TTL for client credentials cache
         
     def _cleanup_client_cache(self):
-        """Clean up expired client cache entries"""
-        current_time = time.time()
+        """Clean up invalid client cache entries"""
         expired_keys = []
         for key, entry in self._client_cache.items():
-            if current_time - entry["timestamp"] >= self._CLIENT_CACHE_TTL:
+            credential = entry.get("credential")
+            if credential and not credential.valid:
                 expired_keys.append(key)
         
         for key in expired_keys:
             del self._client_cache[key]
-            logger.debug(f"[AUTH] Removed expired client cache entry: {key}")
+            logger.debug(f"[AUTH] Removed invalid client cache entry: {key}")
     
     def _get_credentials_hash(self, model: str, credentials: dict) -> str:
         """
@@ -245,13 +244,33 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         # Check if we have a cached client
         cached_entry = self._client_cache.get(credentials_hash)
         if cached_entry:
-            current_time = time.time()
-            if current_time - cached_entry["timestamp"] < self._CLIENT_CACHE_TTL:
-                logger.debug(f"[AUTH] Using cached client for credentials hash {credentials_hash}")
-                return cached_entry["client"]
+            credential = cached_entry.get("credential")
+            client = cached_entry.get("client")
+            
+            if credential and client:
+                if credential.valid:
+                    logger.debug(f"[AUTH] Using cached client for credentials hash {credentials_hash}")
+                    return client
+                else:
+                    # Credential expired, try to refresh
+                    logger.debug(f"[AUTH] Cached credential expired, attempting refresh for credentials hash {credentials_hash}")
+                    try:
+                        import google.auth.transport.requests
+                        request = google.auth.transport.requests.Request()
+                        credential.refresh(request)
+                        
+                        if credential.valid:
+                            logger.debug(f"[AUTH] Credential refresh successful for credentials hash {credentials_hash}")
+                            return client
+                        else:
+                            logger.debug(f"[AUTH] Credential refresh failed, removing from cache")
+                            del self._client_cache[credentials_hash]
+                    except Exception as e:
+                        logger.debug(f"[AUTH] Credential refresh failed with error: {e}")
+                        del self._client_cache[credentials_hash]
             else:
-                # Client expired, remove from cache
-                logger.debug(f"[AUTH] Cached client expired for credentials hash {credentials_hash}")
+                # Invalid cache entry, remove it
+                logger.debug(f"[AUTH] Invalid cache entry structure, removing for credentials hash {credentials_hash}")
                 del self._client_cache[credentials_hash]
         
         # Create new client
@@ -293,10 +312,10 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         # Create and return authenticated client
         client = genai.Client(credentials=credential, project=project_id, location=location, vertexai=True)
         
-        # Cache the client
+        # Cache the client and credential
         self._client_cache[credentials_hash] = {
             "client": client,
-            "timestamp": time.time()
+            "credential": credential
         }
         
         logger.debug(f"[AUTH] Client created and cached successfully (cache size: {len(self._client_cache)})")
