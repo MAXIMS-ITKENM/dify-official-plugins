@@ -71,7 +71,7 @@ if not logger.handlers:
 
 class VertexAiLargeLanguageModel(LargeLanguageModel):
     
-    def __init__(self):
+    def __init__(self, model_schemas=None):
         # Client authentication cache - only for client credentials, not content caching
         self._client_cache = {}
         
@@ -580,6 +580,17 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         dynamic_threshold = config_kwargs.pop("grounding", None)
         thinking_budget = config_kwargs.pop("thinking_budget", None)
         
+        # Handle custom labels if provided
+        custom_labels_str = credentials.get("vertex_custom_labels")
+        labels = None
+        if custom_labels_str:
+            try:
+                labels = json.loads(custom_labels_str)
+                logger.debug(f"[GENERATION] Custom labels parsed: {len(labels) if labels else 0} labels")
+            except (json.JSONDecodeError, TypeError):
+                labels = None
+                logger.warning(f"[GENERATION] Failed to parse custom labels: {custom_labels_str}")
+        
         # Create authenticated client
         client = self._create_authenticated_client(model, credentials)
         
@@ -629,6 +640,10 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         for key, value in config_kwargs.items():
             if key not in ["stop_sequences"]:
                 config_dict[key] = value
+        
+        # Add labels if provided
+        if labels:
+            config_dict["labels"] = labels
 
         generation_config = GenerateContentConfig(
             tools=function_tools,
