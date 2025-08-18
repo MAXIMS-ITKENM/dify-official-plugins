@@ -37,14 +37,6 @@ parameter_rules:
     max: 65535
   - name: json_schema
     use_template: json_schema
-  - name: context_caching
-    label:
-      en_US: Enable Context Caching
-    type: boolean
-    help:
-      en_US: When enabled, the model will cache the system prompt and tools to reduce latency and cost for repeated prompts with the same context.
-    required: false
-    default: false
   - name: grounding
     label:
       en_US: Enable Grounding

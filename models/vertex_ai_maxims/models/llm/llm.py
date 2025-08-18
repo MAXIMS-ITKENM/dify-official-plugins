@@ -1,11 +1,13 @@
 import base64
 import io
 import json
+import re
 import time
 import hashlib
 import logging
 from collections.abc import Generator
-from typing import Optional, Union, cast
+from typing import Optional, Union, cast, Any
+from cachetools import TTLCache
 import google.auth.transport.requests
 import requests
 from anthropic import AnthropicVertex, Stream
@@ -17,7 +19,7 @@ from anthropic.types import (
     MessageStopEvent,
     MessageStreamEvent,
 )
-from dify_plugin.entities.model import PriceType
+from dify_plugin.entities.model import PriceType, AIModelEntity
 from dify_plugin.entities.model.llm import LLMResult, LLMResultChunk, LLMResultChunkDelta, LLMUsage
 from dify_plugin.entities.model.message import (
     AssistantPromptMessage,
@@ -44,11 +46,7 @@ from google.api_core import exceptions
 from google.oauth2 import service_account
 from google import genai
 from google.genai.types import Tool, GenerateContentConfig, GoogleSearch, FunctionDeclaration, FunctionCall, Content, Part, ThinkingConfig
-from typing import Any
 from PIL import Image
-
-
-GLOBAL_ONLY_MODELS = ["gemini-2.5-pro-preview-06-05", "gemini-2.5-flash-lite-preview-06-17"]
 
 # Set up logger for verbose messaging
 logger = logging.getLogger(__name__)
@@ -71,22 +69,13 @@ if not logger.handlers:
 
 class VertexAiLargeLanguageModel(LargeLanguageModel):
     
-    def __init__(self, model_schemas=None):
-        # Client authentication cache - only for client credentials, not content caching
-        self._client_cache = {}
+    def __init__(self, model_schemas: list[AIModelEntity]):
+        # Call parent init with model_schemas
+        super().__init__(model_schemas)
+        # Use a TTL cache that holds up to 100 clients for 1 hour (3600 seconds)
+        # This automatically handles eviction of old or unused clients.
+        self._client_cache = TTLCache(maxsize=100, ttl=3900)
         
-    def _cleanup_client_cache(self):
-        """Clean up invalid client cache entries"""
-        expired_keys = []
-        for key, entry in self._client_cache.items():
-            credential = entry.get("credential")
-            if credential and not credential.valid:
-                expired_keys.append(key)
-        
-        for key in expired_keys:
-            del self._client_cache[key]
-            logger.debug(f"[AUTH] Removed invalid client cache entry: {key}")
-    
     def _get_credentials_hash(self, model: str, credentials: dict) -> str:
         """
         Generate a hash for the credentials to use as cache key.
@@ -103,11 +92,6 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             "service_account_key": credentials.get("vertex_service_account_key", "")[:50] if credentials.get("vertex_service_account_key") else ""  # Use first 50 chars to avoid huge keys
         }
         
-        # Handle global models and preview models location logic
-        if model in GLOBAL_ONLY_MODELS:
-            cache_key_components["location"] = "global"
-        elif "preview" in model:
-            cache_key_components["location"] = "us-central1"
         
         cache_key_str = json.dumps(cache_key_components, sort_keys=True)
         return hashlib.sha256(cache_key_str.encode('utf-8')).hexdigest()[:16]
@@ -235,44 +219,43 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         """
         logger.debug(f"[AUTH] Creating authenticated client for model {model}")
         
-        # Clean up expired client cache entries periodically
-        self._cleanup_client_cache()
+        # No need for manual _cleanup_client_cache() anymore, TTLCache handles it.
         
-        # Generate cache key for this set of credentials
         credentials_hash = self._get_credentials_hash(model, credentials)
         
-        # Check if we have a cached client
-        cached_entry = self._client_cache.get(credentials_hash)
-        if cached_entry:
+        # Check cache first
+        if credentials_hash in self._client_cache:
+            cached_entry = self._client_cache[credentials_hash]
             credential = cached_entry.get("credential")
             client = cached_entry.get("client")
-            
-            if credential and client:
-                if credential.valid:
-                    logger.debug(f"[AUTH] Using cached client for credentials hash {credentials_hash}")
-                    return client
-                else:
-                    # Credential expired, try to refresh
-                    logger.debug(f"[AUTH] Cached credential expired, attempting refresh for credentials hash {credentials_hash}")
-                    try:
-                        import google.auth.transport.requests
-                        request = google.auth.transport.requests.Request()
-                        credential.refresh(request)
-                        
-                        if credential.valid:
-                            logger.debug(f"[AUTH] Credential refresh successful for credentials hash {credentials_hash}")
-                            return client
-                        else:
-                            logger.debug(f"[AUTH] Credential refresh failed, removing from cache")
-                            del self._client_cache[credentials_hash]
-                    except Exception as e:
-                        logger.debug(f"[AUTH] Credential refresh failed with error: {e}")
-                        del self._client_cache[credentials_hash]
+
+            # Still good to check credential validity before returning
+            if credential and credential.valid and client:
+                logger.debug(f"[AUTH] Using cached client for credentials hash {credentials_hash}")
+                return client
             else:
-                # Invalid cache entry, remove it
-                logger.debug(f"[AUTH] Invalid cache entry structure, removing for credentials hash {credentials_hash}")
-                del self._client_cache[credentials_hash]
-        
+                # The credential might be expired, let it fall through to recreate it.
+                logger.debug(f"[AUTH] Cched client for {credentials_hash} has an invalid credentaial. Recreating.")
+
+
+            if credential and not credential.valid and client:
+                logger.debug(f"[AUTH] Cached credential expired. Attempting manual refresh.")
+                try:
+                    
+                    credential.refresh(google.auth.transport.requests.Request())
+
+                    if credential.valid:
+                        logger.info(f"[AUTH] Manual refresh successful.")
+                        
+                        # This is the most important step:
+                        # You tell the cache that this entry is "new" again, resetting its TTL.
+                        self._client_cache[credentials_hash] = cached_entry
+                        
+                        return client
+                except Exception:
+                    # If refresh fails, fall through to create a new client.
+                    logger.error(f"[AUTH] Manual refresh failed. Recreating client.")
+
         # Create new client
         logger.debug(f"[AUTH] Creating new client for credentials hash {credentials_hash}")
         
@@ -290,12 +273,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         
         # Determine project and location
         project_id = credentials["vertex_project_id"]
-        if model in GLOBAL_ONLY_MODELS:
-            location = "global"
-        elif "preview" in model:
-            location = "us-central1"
-        else:
-            location = credentials["vertex_location"]
+        location = credentials["vertex_location"]
         
         logger.debug(f"[AUTH] Using project_id={project_id}, location={location}")
         
@@ -312,7 +290,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         # Create and return authenticated client
         client = genai.Client(credentials=credential, project=project_id, location=location, vertexai=True)
         
-        # Cache the client and credential
+        # When you create a new client, add it to the TTLCache
         self._client_cache[credentials_hash] = {
             "client": client,
             "credential": credential
@@ -505,7 +483,6 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         :param labels: Raw labels dictionary
         :return: Sanitized labels dictionary that meets Google Cloud requirements
         """
-        import re
         
         sanitized_labels = {}
         
@@ -545,7 +522,6 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         :param text: Input text to clean
         :return: Cleaned text with only valid characters, or empty string if no valid characters
         """
-        import re
         
         # Convert to lowercase
         text = text.lower()
@@ -607,32 +583,12 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             
         return has_files
 
-    def _generate(
-        self,
-        model: str,
-        credentials: dict,
-        prompt_messages: list[PromptMessage],
-        model_parameters: dict,
-        tools: Optional[list[PromptMessageTool]] = None,
-        stop: Optional[list[str]] = None,
-        stream: bool = True,
-        user: Optional[str] = None,
-    ) -> Union[LLMResult, Generator]:
-        """
-        Invoke large language model using GenAI API
-
-        :param model: model name
-        :param credentials: credentials kwargs
-        :param prompt_messages: prompt messages
-        :param model_parameters: model parameters
-        :param stop: stop words
-        :param stream: is stream response
-        :param user: unique user id
-        :return: full response or stream response chunk generator result
-        """
+    def _prepare_generation_config(self, model_parameters: dict, tools: Optional[list[PromptMessageTool]], stop: Optional[list[str]], credentials: dict) -> GenerateContentConfig:
+        """Prepares the GenerateContentConfig object from all parameters."""
         config_kwargs = model_parameters.copy()
         config_kwargs["max_output_tokens"] = config_kwargs.pop("max_tokens_to_sample", None)
         
+        # Schema handling
         response_schema = None
         if "json_schema" in config_kwargs:
             response_schema = self._convert_schema_for_vertex(config_kwargs.pop("json_schema"))
@@ -641,56 +597,18 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             
         if "response_schema" in config_kwargs:
             config_kwargs.pop("response_schema")
-            
+        
+        # Extract special parameters
         dynamic_threshold = config_kwargs.pop("grounding", None)
         thinking_budget = config_kwargs.pop("thinking_budget", None)
         
-        # Handle custom labels if provided
-        custom_labels_str = credentials.get("vertex_custom_labels")
-        labels = None
-        if custom_labels_str:
-            try:
-                raw_labels = json.loads(custom_labels_str)
-                if isinstance(raw_labels, dict):
-                    # Sanitize labels to meet Google Cloud requirements
-                    labels = self._sanitize_labels(raw_labels)
-                    if labels:
-                        logger.debug(f"[GENERATION] Custom labels sanitized and parsed: {len(labels)} labels")
-                    else:
-                        logger.warning(f"[GENERATION] All labels were invalid and filtered out")
-                else:
-                    logger.warning(f"[GENERATION] Custom labels must be a dictionary, got {type(raw_labels)}")
-            except (json.JSONDecodeError, TypeError) as e:
-                labels = None
-                logger.warning(f"[GENERATION] Failed to parse custom labels: {e}")
-        
-        # Create authenticated client
-        client = self._create_authenticated_client(model, credentials)
-        
-        # Convert messages to genai format
-        history = []
-        system_instruction = ""
-        
-        for msg in prompt_messages:
-            if isinstance(msg, SystemPromptMessage):
-                system_instruction = msg.content if isinstance(msg.content, str) else str(msg.content)
-            else:
-                content = self._format_message_to_genai_content(msg)
-                history.append(content)
-
         # Prepare tools
-        function_tools = None
-        if tools:
-            function_tools = self._convert_tools_to_genai_tool(tools)
-            if dynamic_threshold:
-                # Function tools take precedence over Google Search
-                dynamic_threshold = None
-        elif dynamic_threshold:
-            # Use Google Search only if no function tools
-            function_tools = [Tool(google_search=GoogleSearch())]
-            dynamic_threshold = None
+        function_tools = self._prepare_tools(tools, dynamic_threshold)
 
-        # Prepare generation config
+        # Handle custom labels
+        labels = self._parse_and_sanitize_labels(credentials)
+
+        # Build the final config dict
         config_dict = {}
         
         # Handle thinking configuration
@@ -703,29 +621,108 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             config_dict["response_mime_type"] = "application/json"
         elif "response_mime_type" in config_kwargs:
             config_dict["response_mime_type"] = config_kwargs.pop("response_mime_type")
-            
-        if stop and isinstance(stop, list):
-            config_dict["stop_sequences"] = stop
-        elif stop:
-            config_dict["stop_sequences"] = [stop] if isinstance(stop, str) else []
-            
+
+        if stop:
+            if isinstance(stop, list):
+                config_dict["stop_sequences"] = stop
+            elif isinstance(stop, str):
+                config_dict["stop_sequences"] = [stop]
+
         # Copy other model parameters
         for key, value in config_kwargs.items():
             if key not in ["stop_sequences"]:
                 config_dict[key] = value
-        
-        # Add labels if provided
+
         if labels:
             config_dict["labels"] = labels
 
-        generation_config = GenerateContentConfig(
+        return GenerateContentConfig(
             tools=function_tools,
             response_modalities=["TEXT"],
-            system_instruction=system_instruction,
             thinking_config=thinking_config,
             **config_dict
         )
+
+    def _prepare_tools(self, tools: Optional[list[PromptMessageTool]], dynamic_threshold: Optional[bool]) -> Optional[list[Tool]]:
+        """Prepares tools for the API call, handling grounding as a fallback."""
+        function_tools = None
+        if tools:
+            function_tools = self._convert_tools_to_genai_tool(tools)
+            # Function tools take precedence over Google Search
+        elif dynamic_threshold:
+            # Use Google Search only if no function tools
+            function_tools = [Tool(google_search=GoogleSearch())]
+        return function_tools
+
+    def _parse_and_sanitize_labels(self, credentials: dict) -> Optional[dict]:
+        """Parses and sanitizes custom labels from credentials."""
+        custom_labels_str = credentials.get("vertex_custom_labels")
+        if not custom_labels_str:
+            return None
+        try:
+            raw_labels = json.loads(custom_labels_str)
+            if isinstance(raw_labels, dict):
+                sanitized = self._sanitize_labels(raw_labels)
+                if sanitized:
+                    logger.debug(f"[GENERATION] Custom labels parsed: {len(sanitized)} labels")
+                    return sanitized
+                else:
+                    logger.warning(f"[GENERATION] All labels were invalid and filtered out")
+            else:
+                logger.warning(f"[GENERATION] Custom labels must be a dictionary, got {type(raw_labels)}")
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning(f"[GENERATION] Failed to parse custom labels: {e}")
+        return None
+
+    def _prepare_messages(self, prompt_messages: list[PromptMessage]) -> tuple[list, str]:
+        """Prepares messages by separating system instruction from conversation history."""
+        history = []
+        system_instruction = ""
         
+        for msg in prompt_messages:
+            if isinstance(msg, SystemPromptMessage):
+                system_instruction = msg.content if isinstance(msg.content, str) else str(msg.content)
+            else:
+                content = self._format_message_to_genai_content(msg)
+                history.append(content)
+        
+        return history, system_instruction
+
+    def _generate(
+        self,
+        model: str,
+        credentials: dict,
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        tools: Optional[list[PromptMessageTool]] = None,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        user: Optional[str] = None,  # 'user' is unused, consider removing
+    ) -> Union[LLMResult, Generator]:
+        """
+        Invoke large language model using GenAI API
+
+        :param model: model name
+        :param credentials: credentials kwargs
+        :param prompt_messages: prompt messages
+        :param model_parameters: model parameters
+        :param tools: tools for tool calling
+        :param stop: stop words
+        :param stream: is stream response
+        :param user: unique user id
+        :return: full response or stream response chunk generator result
+        """
+        # 1. Create Client
+        client = self._create_authenticated_client(model, credentials)
+
+        # 2. Prepare Messages
+        history, system_instruction = self._prepare_messages(prompt_messages)
+        
+        # 3. Prepare Generation Config
+        generation_config = self._prepare_generation_config(model_parameters, tools, stop, credentials)
+        generation_config.system_instruction = system_instruction  # Add system instruction here
+
+        # 4. Make API Call
         if stream:
             response = client.models.generate_content_stream(
                 model=model,
@@ -753,7 +750,6 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         :param prompt_messages: prompt messages
         :return: llm response
         """
-        import time
         response_start = time.time()
         
         logger.info(f"[RESPONSE] Processing non-stream response for model {model}")
@@ -818,7 +814,6 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         :param system_instruction: system instruction
         :return: llm response chunk generator result
         """
-        import time
         stream_start = time.time()
         
         logger.info(f"[STREAM] Starting stream response processing for model {model}")
