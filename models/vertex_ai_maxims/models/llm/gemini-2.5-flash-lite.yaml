@@ -1,0 +1,77 @@
+model: gemini-2.5-flash-lite
+label:
+  en_US: Gemini 2.5 Flash Lite
+model_type: llm
+features:
+  - agent-thought
+  - vision
+  - tool-call
+  - stream-tool-call
+  - document
+  - video
+  - audio
+model_properties:
+  mode: chat
+  context_size: 1048576
+parameter_rules:
+  - name: temperature
+    use_template: temperature
+    default: 0.7
+    min: 0
+    max: 2
+  - name: top_p
+    use_template: top_p
+  - name: top_k
+    label:
+      zh_Hans: 取样数量
+      en_US: Top k
+    type: int
+    help:
+      zh_Hans: 仅从每个后续标记的前 K 个选项中采样。
+      en_US: Only sample from the top K options for each subsequent token.
+    required: false
+  - name: max_output_tokens
+    use_template: max_tokens
+    default: 65535
+    min: 1
+    max: 65535
+  - name: json_schema
+    use_template: json_schema
+  - name: context_caching
+    label:
+      en_US: Enable Context Caching
+    type: boolean
+    help:
+      en_US: When enabled, the model will cache the system prompt and tools to reduce latency and cost for repeated prompts with the same context.
+    required: false
+    default: false
+  - name: grounding
+    label:
+      en_US: Enable Grounding
+    type: boolean
+    help:
+      en_US: When enabled, allows the model to search the web for current information and cite sources.
+    required: false
+    default: false
+  - name: no_thinking
+    label:
+      en_US: Disable Thinking
+    type: boolean
+    help:
+      en_US: When enabled, disables the thinking process. Takes precedence over thinking_budget.
+    required: false
+    default: false
+  - name: thinking_budget
+    label:
+      en_US: Thinking Budget
+    type: int
+    help:
+      en_US: The maximum number of tokens to use for thinking. Only used when 'Disable Thinking' is false. Disable this control to let the model control the thinking budget.
+    required: false
+    min: 512
+    max: 24576
+pricing:
+  input: '0.10'
+  output: '0.40'
+  unit: '0.000001'
+  currency: USD
