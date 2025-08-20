@@ -188,3 +188,5 @@ pyrightconfig.json
 mypy.ini
 tox.ini
 *.difypkg
+dify_plugin_cli/
+dify_plugin_cli/*

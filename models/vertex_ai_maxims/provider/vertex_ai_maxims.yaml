@@ -8,7 +8,7 @@ extra:
     model_sources:
     - models/llm/llm.py
     - models/text_embedding/text_embedding.py
-    provider_source: provider/vertex_ai.py
+    provider_source: provider/vertex_ai_maxims.py
 help:
   title:
     en_US: Get your Access Details from Google

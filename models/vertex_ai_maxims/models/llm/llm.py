@@ -9,16 +9,6 @@ from collections.abc import Generator
 from typing import Optional, Union, cast, Any
 from cachetools import TTLCache
 import google.auth.transport.requests
-import requests
-from anthropic import AnthropicVertex, Stream
-from anthropic.types import (
-    ContentBlockDeltaEvent,
-    Message,
-    MessageDeltaEvent,
-    MessageStartEvent,
-    MessageStopEvent,
-    MessageStreamEvent,
-)
 from dify_plugin.entities.model import PriceType, AIModelEntity
 from dify_plugin.entities.model.llm import LLMResult, LLMResultChunk, LLMResultChunkDelta, LLMUsage
 from dify_plugin.entities.model.message import (
